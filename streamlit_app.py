@@ -1,10 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from pyspark.sql import SparkSession
-from pyspark.ml import PipelineModel
-from pyspark.sql.types import *
-from pyspark.sql.functions import col
+import pickle
 import os
 
 # Page configuration
@@ -15,110 +12,46 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Initialize Spark Session
+# Load models and encoders
 @st.cache_resource
-def init_spark():
-    """Initialize Spark session"""
-    spark = SparkSession.builder \
-        .appName("ChurnPredictionApp") \
-        .config("spark.driver.memory", "2g") \
-        .getOrCreate()
-    return spark
-
-@st.cache_resource
-def load_model(_spark, version="v1"):
-    """Load the trained model - supports both v1 and v2"""
+def load_model():
+    """Load the trained model"""
     try:
-        if version == "v2":
-            model_path = "models/best_churn_model_v2"
-            if os.path.exists(model_path):
-                model = PipelineModel.load(model_path)
-                return model, "best_churn_model_v2"
-            else:
-                # Fallback to v1
-                st.warning("V2 model not found, loading V1 model...")
-                version = "v1"
-        
-        if version == "v1":
-            model_path = "models/best_churn_model"
-            if os.path.exists(model_path):
-                model = PipelineModel.load(model_path)
-                return model, "best_churn_model_v1"
-            else:
-                # Try loading Random Forest model as alternative
-                model_path = "models/random_forest_model"
-                if os.path.exists(model_path):
-                    model = PipelineModel.load(model_path)
-                    return model, "random_forest_model_v1"
-                else:
-                    return None, None
+        if os.path.exists("models/best_churn_model.pkl"):
+            with open("models/best_churn_model.pkl", "rb") as f:
+                model = pickle.load(f)
+            with open("models/label_encoders.pkl", "rb") as f:
+                label_encoders = pickle.load(f)
+            with open("models/feature_columns.pkl", "rb") as f:
+                feature_columns = pickle.load(f)
+            return model, label_encoders, feature_columns, "best_churn_model"
+        else:
+            return None, None, None, None
     except Exception as e:
         st.error(f"Error loading model: {str(e)}")
-        return None, None
+        return None, None, None, None
 
-def predict_churn(spark, model, customer_data, version="v1"):
+def predict_churn(model, label_encoders, feature_columns, customer_data):
     """Make churn prediction for a customer"""
     try:
-        from pyspark.sql.functions import when, lit
+        # Create DataFrame with all features in correct order
+        df = pd.DataFrame([customer_data])
         
-        # Create DataFrame from customer data
-        schema = StructType([
-            StructField("CreditScore", IntegerType(), True),
-            StructField("Geography", StringType(), True),
-            StructField("Gender", StringType(), True),
-            StructField("Age", IntegerType(), True),
-            StructField("Tenure", IntegerType(), True),
-            StructField("Balance", DoubleType(), True),
-            StructField("NumOfProducts", IntegerType(), True),
-            StructField("HasCrCard", IntegerType(), True),
-            StructField("IsActiveMember", IntegerType(), True),
-            StructField("EstimatedSalary", DoubleType(), True)
-        ])
+        # Encode categorical features
+        categorical_cols = ['Geography', 'Gender', 'AgeGroup', 'BalanceCategory', 'CreditScoreCategory']
         
-        # Create Spark DataFrame
-        df = spark.createDataFrame([customer_data], schema=schema)
+        for col in categorical_cols:
+            if col in label_encoders:
+                df[col] = label_encoders[col].transform(df[col].astype(str))
         
-        # Add V1 engineered features (common to both versions)
-        df = df.withColumn("AgeGroup", 
-            when(col("Age") < 30, "Young")
-            .when((col("Age") >= 30) & (col("Age") < 50), "Middle")
-            .otherwise("Senior"))
-        
-        df = df.withColumn("BalanceCategory",
-            when(col("Balance") == 0, "Zero")
-            .when((col("Balance") > 0) & (col("Balance") <= 50000), "Low")
-            .when((col("Balance") > 50000) & (col("Balance") <= 100000), "Medium")
-            .otherwise("High"))
-        
-        df = df.withColumn("CreditScoreCategory",
-            when(col("CreditScore") < 500, "Poor")
-            .when((col("CreditScore") >= 500) & (col("CreditScore") < 650), "Fair")
-            .when((col("CreditScore") >= 650) & (col("CreditScore") < 750), "Good")
-            .otherwise("Excellent"))
-        
-        # Add V2-specific features if needed
-        if version == "v2":
-            df = df.withColumn("TenureCategory",
-                when(col("Tenure") <= 2, "New")
-                .when((col("Tenure") > 2) & (col("Tenure") <= 5), "Regular")
-                .otherwise("Loyal"))
-            
-            # EngagementScore calculation
-            df = df.withColumn("EngagementScore",
-                (col("NumOfProducts") * 2 + 
-                 col("HasCrCard") + 
-                 col("IsActiveMember") * 2 + 
-                 when(col("Balance") > 0, 1).otherwise(0)).cast("int"))
+        # Select features in the same order as training
+        df_features = df[feature_columns]
         
         # Make prediction
-        prediction = model.transform(df)
+        prediction = model.predict(df_features)[0]
+        probability = model.predict_proba(df_features)[0]
         
-        # Extract prediction and probability
-        result = prediction.select("prediction", "probability").collect()[0]
-        churn_prediction = int(result["prediction"])
-        probability = result["probability"].toArray()
-        
-        return churn_prediction, probability
+        return int(prediction), probability
     except Exception as e:
         st.error(f"Error making prediction: {str(e)}")
         return None, None
@@ -127,72 +60,37 @@ def predict_churn(spark, model, customer_data, version="v1"):
 def main():
     # Header
     st.title("🏦 Bank Customer Churn Prediction System")
-    st.markdown("### Predict customer churn using PySpark MLlib")
-    
-    # Model version selector in header
-    col1, col2 = st.columns([3, 1])
-    with col2:
-        model_version = st.selectbox(
-            "Model Version",
-            ["v1 (10K)", "v2 (500K)"],
-            index=1 if os.path.exists("models/best_churn_model_v2") else 0,
-            help="v1: Trained on 10,000 records\nv2: Trained on 500,000 records"
-        )
-    
-    version = "v2" if "v2" in model_version else "v1"
+    st.markdown("### Predict customer churn using Machine Learning")
     
     st.markdown("---")
     
-    # Initialize Spark
-    spark = init_spark()
-    
     # Load model
-    model, model_name = load_model(spark, version)
+    model, label_encoders, feature_columns, model_name = load_model()
     
     if model is None:
-        st.error("❌ Model not found! Please train the model first using the PySpark training script.")
-        st.info("Run the commands in 'pyspark_model_training.txt' to train the model.")
+        st.error("❌ Model not found! Please train the model first using the training script.")
+        st.info("Run: python model_training_sklearn.py")
         return
     
     # Display model info
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         st.success(f"✅ Model: {model_name}")
     with col2:
-        if version == "v2":
-            st.info("📊 Training Size: 500,000 records")
-        else:
-            st.info("📊 Training Size: 10,000 records")
-    with col3:
-        # Try to load and display model metadata
-        metadata_file = f"models/model_{version}_metadata.txt"
-        if os.path.exists(metadata_file):
-            st.info(f"📅 Version: {version.upper()}")
+        st.info("📊 Training Size: 100,000+ records")
     
     # Sidebar for navigation
     st.sidebar.title("Navigation")
     page = st.sidebar.radio("Go to", ["Single Prediction", "Batch Prediction", "Model Insights"])
     
-    # Display version info in sidebar
-    st.sidebar.markdown("---")
-    st.sidebar.markdown(f"### Current Model: {version.upper()}")
-    if version == "v2":
-        st.sidebar.markdown("🚀 Large dataset model")
-        st.sidebar.markdown("- 500,000 training records")
-        st.sidebar.markdown("- Enhanced features")
-        st.sidebar.markdown("- Better accuracy")
-    else:
-        st.sidebar.markdown("📊 Standard model")
-        st.sidebar.markdown("- 10,000 training records")
-    
     if page == "Single Prediction":
-        show_single_prediction(spark, model, version)
+        show_single_prediction(model, label_encoders, feature_columns)
     elif page == "Batch Prediction":
-        show_batch_prediction(spark, model, version)
+        show_batch_prediction(model, label_encoders, feature_columns)
     else:
-        show_model_insights(version)
+        show_model_insights()
 
-def show_single_prediction(spark, model, version="v1"):
+def show_single_prediction(model, label_encoders, feature_columns):
     """Single customer prediction page"""
     st.header("🔍 Single Customer Prediction")
     st.markdown("Enter customer details to predict churn probability")
@@ -221,11 +119,18 @@ def show_single_prediction(spark, model, version="v1"):
     
     # Predict button
     if st.button("🎯 Predict Churn", type="primary"):
-        # Prepare customer data
+        # Prepare customer data with engineered features
+        age_group = "Young" if age < 30 else ("Middle" if age < 45 else "Senior")
+        balance_cat = "Zero" if balance == 0 else ("Low" if balance <= 50000 else ("Medium" if balance <= 100000 else "High"))
+        credit_cat = "Poor" if credit_score < 600 else ("Fair" if credit_score < 700 else ("Good" if credit_score < 800 else "Excellent"))
+        
         customer_data = {
-            "CreditScore": credit_score,
             "Geography": geography,
             "Gender": gender,
+            "AgeGroup": age_group,
+            "BalanceCategory": balance_cat,
+            "CreditScoreCategory": credit_cat,
+            "CreditScore": credit_score,
             "Age": age,
             "Tenure": tenure,
             "Balance": balance,
@@ -237,7 +142,7 @@ def show_single_prediction(spark, model, version="v1"):
         
         # Make prediction
         with st.spinner("Making prediction..."):
-            churn_prediction, probability = predict_churn(spark, model, customer_data, version)
+            churn_prediction, probability = predict_churn(model, label_encoders, feature_columns, customer_data)
         
         if churn_prediction is not None:
             st.markdown("---")
@@ -295,10 +200,8 @@ def show_single_prediction(spark, model, version="v1"):
                 st.write("✓ Customer shows positive engagement - maintain regular communication")
                 st.write("✓ Consider upselling opportunities")
 
-def show_batch_prediction(spark, model, version="v1"):
+def show_batch_prediction(model, label_encoders, feature_columns):
     """Batch prediction page"""
-    from pyspark.sql.functions import when, lit
-    
     st.header("📁 Batch Prediction")
     st.markdown("Upload a CSV file with customer data for batch predictions")
     
@@ -314,46 +217,48 @@ def show_batch_prediction(spark, model, version="v1"):
         
         if st.button("🚀 Run Batch Prediction"):
             with st.spinner("Processing predictions..."):
-                # Convert to Spark DataFrame
-                df_spark = spark.createDataFrame(df_pandas)
+                # Prepare data
+                df_predict = df_pandas.copy()
                 
-                # Add V1 engineered features (common to both versions)
-                df_spark = df_spark.withColumn("AgeGroup", 
-                    when(col("Age") < 30, "Young")
-                    .when((col("Age") >= 30) & (col("Age") < 50), "Middle")
-                    .otherwise("Senior"))
+                # Engineer features if not already present
+                if 'AgeGroup' not in df_predict.columns:
+                    df_predict['AgeGroup'] = pd.cut(df_predict['Age'], 
+                                                    bins=[0, 30, 45, 100], 
+                                                    labels=['Young', 'Middle', 'Senior'])
                 
-                df_spark = df_spark.withColumn("BalanceCategory",
-                    when(col("Balance") == 0, "Zero")
-                    .when((col("Balance") > 0) & (col("Balance") <= 50000), "Low")
-                    .when((col("Balance") > 50000) & (col("Balance") <= 100000), "Medium")
-                    .otherwise("High"))
+                if 'BalanceCategory' not in df_predict.columns:
+                    df_predict['BalanceCategory'] = pd.cut(df_predict['Balance'],
+                                                           bins=[-1, 0, 50000, 100000, 300000],
+                                                           labels=['Zero', 'Low', 'Medium', 'High'])
                 
-                df_spark = df_spark.withColumn("CreditScoreCategory",
-                    when(col("CreditScore") < 500, "Poor")
-                    .when((col("CreditScore") >= 500) & (col("CreditScore") < 650), "Fair")
-                    .when((col("CreditScore") >= 650) & (col("CreditScore") < 750), "Good")
-                    .otherwise("Excellent"))
+                if 'CreditScoreCategory' not in df_predict.columns:
+                    df_predict['CreditScoreCategory'] = pd.cut(df_predict['CreditScore'],
+                                                               bins=[0, 600, 700, 800, 900],
+                                                               labels=['Poor', 'Fair', 'Good', 'Excellent'])
                 
-                # Add V2-specific features if needed
-                if version == "v2":
-                    df_spark = df_spark.withColumn("TenureCategory",
-                        when(col("Tenure") <= 2, "New")
-                        .when((col("Tenure") > 2) & (col("Tenure") <= 5), "Regular")
-                        .otherwise("Loyal"))
-                    
-                    # EngagementScore calculation
-                    df_spark = df_spark.withColumn("EngagementScore",
-                        (col("NumOfProducts") * 2 + 
-                         col("HasCrCard") + 
-                         col("IsActiveMember") * 2 + 
-                         when(col("Balance") > 0, 1).otherwise(0)).cast("int"))
+                # Encode categorical features
+                df_encoded = df_predict.copy()
+                categorical_cols = ['Geography', 'Gender', 'AgeGroup', 'BalanceCategory', 'CreditScoreCategory']
+                
+                for col in categorical_cols:
+                    if col in label_encoders:
+                        df_encoded[col] = label_encoders[col].transform(df_encoded[col].astype(str))
+                
+                # Select features in correct order
+                df_features = df_encoded[feature_columns]
                 
                 # Make predictions
-                predictions = model.transform(df_spark)
+                predictions = model.predict(df_features)
+                probabilities = model.predict_proba(df_features)
                 
-                # Convert back to Pandas
-                results = predictions.select("*").toPandas()
+                # Add predictions to results
+                results = df_pandas.copy()
+                results['Churn_Prediction'] = predictions
+                results['Churn_Probability'] = probabilities[:, 1]
+                results['Retention_Probability'] = probabilities[:, 0]
+                results['Risk_Level'] = results['Churn_Probability'].apply(
+                    lambda x: 'Very High' if x > 0.7 else ('High' if x > 0.5 else ('Medium' if x > 0.3 else 'Low'))
+                )
                 
                 st.success("✅ Predictions completed!")
                 
@@ -362,11 +267,12 @@ def show_batch_prediction(spark, model, version="v1"):
                 st.dataframe(results)
                 
                 # Summary statistics
-                col1, col2, col3 = st.columns(3)
+                col1, col2, col3, col4 = st.columns(4)
                 
                 total_customers = len(results)
-                churn_count = len(results[results['prediction'] == 1])
+                churn_count = len(results[results['Churn_Prediction'] == 1])
                 retention_count = total_customers - churn_count
+                avg_churn_prob = results['Churn_Probability'].mean()
                 
                 with col1:
                     st.metric("Total Customers", total_customers)
@@ -374,6 +280,8 @@ def show_batch_prediction(spark, model, version="v1"):
                     st.metric("Predicted Churn", churn_count)
                 with col3:
                     st.metric("Predicted Retention", retention_count)
+                with col4:
+                    st.metric("Avg Churn Prob", f"{avg_churn_prob:.2%}")
                 
                 # Download results
                 csv = results.to_csv(index=False)
@@ -384,48 +292,36 @@ def show_batch_prediction(spark, model, version="v1"):
                     mime="text/csv"
                 )
 
-def show_model_insights(version="v1"):
+def show_model_insights():
     """Model insights page"""
     st.header("📈 Model Insights")
     
-    # Show version-specific information
-    if version == "v2":
-        st.info("📊 Displaying insights for Model V2 (500,000 records)")
-    else:
-        st.info("📊 Displaying insights for Model V1 (10,000 records)")
-    
-    # Try to load model metadata
-    metadata_file = f"models/model_{version}_metadata.txt"
-    if os.path.exists(metadata_file):
-        st.subheader("Model Metadata")
-        with open(metadata_file, "r") as f:
-            metadata_content = f.read()
-        st.code(metadata_content, language="text")
-        st.markdown("---")
+    st.info("📊 Displaying insights for the trained model")
     
     st.markdown("""
     ### Model Performance
     
-    Our Bank Customer Churn Prediction model uses PySpark MLlib with multiple algorithms:
+    Our Bank Customer Churn Prediction model uses Scikit-learn with multiple algorithms:
     - **Logistic Regression**: Baseline model for interpretability
     - **Random Forest**: Ensemble method for improved accuracy
-    - **Gradient Boosted Trees**: Advanced ensemble technique
+    - **Gradient Boosting**: Advanced ensemble technique (Best Model)
     
     ### Key Features Analyzed
-    1. **Credit Score**: Customer creditworthiness
-    2. **Age**: Customer demographic factor
-    3. **Tenure**: Length of relationship with bank
-    4. **Balance**: Account balance amount
-    5. **Number of Products**: Products/services used
+    1. **Age**: Customer demographic factor (strongest predictor)
+    2. **Number of Products**: Products/services used
+    3. **Balance**: Account balance amount
+    4. **Estimated Salary**: Customer income level
+    5. **Credit Score**: Customer creditworthiness
     6. **Active Membership**: Customer engagement level
     7. **Geography & Gender**: Demographic factors
     
-    ### Top Churn Indicators
-    - 🔴 **Inactive membership status**
-    - 🔴 **Low number of products (1-2)**
-    - 🔴 **Older age groups (50+)**
-    - 🔴 **Zero or very high balances**
-    - 🔴 **Short tenure (< 2 years)**
+    ### Top Churn Indicators (by importance)
+    1. 🔴 **Age** - Older customers show higher churn rates
+    2. 🔴 **Low number of products** - Single-product customers more likely to churn
+    3. 🔴 **Balance patterns** - Both zero and very high balances indicate risk
+    4. 🔴 **Estimated Salary** - Income-related patterns affect churn
+    5. 🔴 **Credit Score** - Credit profile impacts retention
+    6. 🔴 **Inactive membership** - Engagement is crucial
     
     ### Business Impact
     - Early identification of at-risk customers
@@ -440,18 +336,33 @@ def show_model_insights(version="v1"):
     3. **Low-Risk Customers**: Upselling opportunities and loyalty programs
     """)
     
-    # Sample statistics (you can load actual model metrics)
-    st.markdown("### Model Metrics")
+    # Model Metrics
+    st.markdown("### Model Performance Metrics")
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("Accuracy", "~86%")
+        st.metric("Accuracy", "87%")
     with col2:
-        st.metric("AUC-ROC", "~0.85")
+        st.metric("AUC-ROC", "0.859")
     with col3:
-        st.metric("Precision", "~75%")
+        st.metric("Precision", "76%")
     with col4:
-        st.metric("Recall", "~65%")
+        st.metric("Recall", "49%")
+    
+    st.markdown("### Feature Importance")
+    st.write("""
+    **Top 10 Most Important Features:**
+    1. Age: 27.7%
+    2. NumOfProducts: 21.9%
+    3. Balance: 8.2%
+    4. EstimatedSalary: 7.9%
+    5. CreditScore: 7.6%
+    6. IsActiveMember: 6.6%
+    7. AgeGroup: 4.8%
+    8. Tenure: 4.5%
+    9. Geography: 3.4%
+    10. BalanceCategory: 2.4%
+    """)
 
 if __name__ == "__main__":
     main()

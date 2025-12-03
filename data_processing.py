@@ -144,10 +144,7 @@ def main():
     
     print("\nSaving processed data...")
     
-    # Save as Parquet
-    df_clean.write.mode("overwrite").parquet("dataset/processed_churn_data.parquet")
-    
-    # Save as CSV
+    # Save as CSV only (Parquet has Hadoop issues on Windows)
     df_clean.coalesce(1).write.mode("overwrite") \
         .option("header", "true") \
         .csv("dataset/processed_churn_data_csv")

@@ -30,7 +30,8 @@ def main():
     # ============================================================================
     
     print("\nLoading preprocessed data...")
-    df = spark.read.parquet("dataset/processed_churn_data.parquet")
+    # Read from CSV (replaces Parquet due to Windows Hadoop issues)
+    df = spark.read.csv("dataset/processed_churn_data_csv", header=True, inferSchema=True)
     
     print(f"Dataset loaded: {df.count()} rows, {len(df.columns)} columns")
     df.printSchema()
