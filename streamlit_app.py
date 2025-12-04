@@ -216,81 +216,120 @@ def show_batch_prediction(model, label_encoders, feature_columns):
         st.dataframe(df_pandas.head())
         
         if st.button("🚀 Run Batch Prediction"):
-            with st.spinner("Processing predictions..."):
-                # Prepare data
-                df_predict = df_pandas.copy()
-                
-                # Engineer features if not already present
-                if 'AgeGroup' not in df_predict.columns:
-                    df_predict['AgeGroup'] = pd.cut(df_predict['Age'], 
-                                                    bins=[0, 30, 45, 100], 
-                                                    labels=['Young', 'Middle', 'Senior'])
-                
-                if 'BalanceCategory' not in df_predict.columns:
-                    df_predict['BalanceCategory'] = pd.cut(df_predict['Balance'],
-                                                           bins=[-1, 0, 50000, 100000, 300000],
-                                                           labels=['Zero', 'Low', 'Medium', 'High'])
-                
-                if 'CreditScoreCategory' not in df_predict.columns:
-                    df_predict['CreditScoreCategory'] = pd.cut(df_predict['CreditScore'],
-                                                               bins=[0, 600, 700, 800, 900],
-                                                               labels=['Poor', 'Fair', 'Good', 'Excellent'])
-                
-                # Encode categorical features
-                df_encoded = df_predict.copy()
-                categorical_cols = ['Geography', 'Gender', 'AgeGroup', 'BalanceCategory', 'CreditScoreCategory']
-                
-                for col in categorical_cols:
-                    if col in label_encoders:
-                        df_encoded[col] = label_encoders[col].transform(df_encoded[col].astype(str))
-                
-                # Select features in correct order
-                df_features = df_encoded[feature_columns]
-                
-                # Make predictions
-                predictions = model.predict(df_features)
-                probabilities = model.predict_proba(df_features)
-                
-                # Add predictions to results
-                results = df_pandas.copy()
-                results['Churn_Prediction'] = predictions
-                results['Churn_Probability'] = probabilities[:, 1]
-                results['Retention_Probability'] = probabilities[:, 0]
-                results['Risk_Level'] = results['Churn_Probability'].apply(
-                    lambda x: 'Very High' if x > 0.7 else ('High' if x > 0.5 else ('Medium' if x > 0.3 else 'Low'))
-                )
-                
-                st.success("✅ Predictions completed!")
-                
-                # Show results
-                st.subheader("Prediction Results")
-                st.dataframe(results)
-                
-                # Summary statistics
-                col1, col2, col3, col4 = st.columns(4)
-                
-                total_customers = len(results)
-                churn_count = len(results[results['Churn_Prediction'] == 1])
-                retention_count = total_customers - churn_count
-                avg_churn_prob = results['Churn_Probability'].mean()
-                
-                with col1:
-                    st.metric("Total Customers", total_customers)
-                with col2:
-                    st.metric("Predicted Churn", churn_count)
-                with col3:
-                    st.metric("Predicted Retention", retention_count)
-                with col4:
-                    st.metric("Avg Churn Prob", f"{avg_churn_prob:.2%}")
-                
-                # Download results
-                csv = results.to_csv(index=False)
-                st.download_button(
-                    label="📥 Download Results as CSV",
-                    data=csv,
-                    file_name="churn_predictions.csv",
-                    mime="text/csv"
-                )
+            try:
+                with st.spinner("Processing predictions..."):
+                    # Prepare data
+                    df_predict = df_pandas.copy()
+                    
+                    # Engineer features if not already present
+                    if 'AgeGroup' not in df_predict.columns:
+                        df_predict['AgeGroup'] = pd.cut(df_predict['Age'], 
+                                                        bins=[0, 30, 45, 100], 
+                                                        labels=['Young', 'Middle', 'Senior'])
+                    
+                    # Balance category - match trained encoder categories: ['High', 'Low', 'Medium']
+                    if 'BalanceCategory' not in df_predict.columns:
+                        # Map balance to correct categories (no 'Zero' in encoder)
+                        def categorize_balance(balance):
+                            if balance <= 50000:
+                                return 'Low'
+                            elif balance <= 100000:
+                                return 'Medium'
+                            else:
+                                return 'High'
+                        
+                        df_predict['BalanceCategory'] = df_predict['Balance'].apply(categorize_balance)
+                    
+                    # Credit Score category - match encoder categories: ['Excellent', 'Fair', 'Good', 'Poor']
+                    if 'CreditScoreCategory' not in df_predict.columns:
+                        df_predict['CreditScoreCategory'] = pd.cut(df_predict['CreditScore'],
+                                                                   bins=[0, 600, 700, 800, 900],
+                                                                   labels=['Poor', 'Fair', 'Good', 'Excellent'],
+                                                                   include_lowest=True)
+                    
+                    # Encode categorical features with error handling
+                    df_encoded = df_predict.copy()
+                    categorical_cols = ['Geography', 'Gender', 'AgeGroup', 'BalanceCategory', 'CreditScoreCategory']
+                    
+                    errors = []
+                    for col in categorical_cols:
+                        if col in label_encoders:
+                            try:
+                                # Convert to string
+                                df_encoded[col] = df_encoded[col].astype(str)
+                                
+                                # Check for unseen labels
+                                known_classes = set(label_encoders[col].classes_)
+                                seen_values = set(df_encoded[col].unique())
+                                unseen = seen_values - known_classes
+                                
+                                if unseen:
+                                    errors.append(f"Column '{col}' has unseen values: {unseen}. Using mode value as replacement.")
+                                    # Replace unseen values with the first known class
+                                    default_class = label_encoders[col].classes_[0]
+                                    for unseen_val in unseen:
+                                        df_encoded.loc[df_encoded[col] == unseen_val, col] = default_class
+                                
+                                # Transform using label encoder
+                                df_encoded[col] = label_encoders[col].transform(df_encoded[col])
+                            except Exception as e:
+                                raise ValueError(f"Error encoding column '{col}': {str(e)}")
+                    
+                    # Select features in correct order
+                    df_features = df_encoded[feature_columns]
+                    
+                    # Make predictions
+                    predictions = model.predict(df_features)
+                    probabilities = model.predict_proba(df_features)
+                    
+                    # Add predictions to results
+                    results = df_pandas.copy()
+                    results['Churn_Prediction'] = predictions
+                    results['Churn_Probability'] = probabilities[:, 1]
+                    results['Retention_Probability'] = probabilities[:, 0]
+                    results['Risk_Level'] = results['Churn_Probability'].apply(
+                        lambda x: 'Very High' if x > 0.7 else ('High' if x > 0.5 else ('Medium' if x > 0.3 else 'Low'))
+                    )
+                    
+                    st.success("✅ Predictions completed!")
+                    
+                    # Show warnings if any
+                    if errors:
+                        for error in errors:
+                            st.warning(error)
+                    
+                    # Show results
+                    st.subheader("Prediction Results")
+                    st.dataframe(results)
+                    
+                    # Summary statistics
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    total_customers = len(results)
+                    churn_count = len(results[results['Churn_Prediction'] == 1])
+                    retention_count = total_customers - churn_count
+                    avg_churn_prob = results['Churn_Probability'].mean()
+                    
+                    with col1:
+                        st.metric("Total Customers", total_customers)
+                    with col2:
+                        st.metric("Predicted Churn", churn_count)
+                    with col3:
+                        st.metric("Predicted Retention", retention_count)
+                    with col4:
+                        st.metric("Avg Churn Prob", f"{avg_churn_prob:.2%}")
+                    
+                    # Download results
+                    csv = results.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Download Results as CSV",
+                        data=csv,
+                        file_name="churn_predictions.csv",
+                        mime="text/csv"
+                    )
+            except Exception as e:
+                st.error(f"❌ Error during batch prediction: {str(e)}")
+                st.info("Please ensure your CSV file contains all required columns: Geography, Gender, Age, CreditScore, Tenure, Balance, NumOfProducts, HasCrCard, IsActiveMember, EstimatedSalary")
 
 def show_model_insights():
     """Model insights page"""
